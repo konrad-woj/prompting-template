@@ -1,0 +1,5 @@
+research_assistant:
+  explain_code: [code_navigation]
+  research: [code_navigation, web_research]
+  change_code: [code_navigation, code_change]
+  default: [general_help]
