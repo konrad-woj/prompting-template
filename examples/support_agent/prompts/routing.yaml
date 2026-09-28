@@ -1,0 +1,10 @@
+support_agent:
+  refund_request: [account_verification, refund_processing]
+  order_status: [account_verification]
+  email_request: [account_verification, email_followup]
+  default: [general_help]
+
+billing_agent:
+  refund_request: [account_verification, refund_processing]
+  invoice_dispute: [account_verification, refund_processing]
+  default: [general_help]

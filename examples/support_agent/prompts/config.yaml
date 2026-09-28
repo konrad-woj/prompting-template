@@ -1,0 +1,5 @@
+agent_name: Ava
+company_name: Acme Outdoor
+support_email: help@acme.example
+refund_window_days: 30
+refund_processing_days: 5
