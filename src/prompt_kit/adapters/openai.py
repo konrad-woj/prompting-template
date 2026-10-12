@@ -45,7 +45,7 @@ AFFIRMATIVE_WORDS = frozenset(
     }
 )
 NEGATIVE_WORDS = frozenset(
-    {"no", "not", "don't", "dont", "cancel", "stop", "wait", "instead"}
+    {"no", "not", "don't", "dont", "cancel", "stop", "wait", "instead", "but"}
 )
 CLEARED_TOOL_RESULT = json.dumps(
     {
@@ -91,10 +91,18 @@ def tool_calls_from_message(message: Message) -> list[ToolCall]:
         ToolCall(
             id=tool_call["id"],
             name=tool_call["function"]["name"],
-            arguments=json.loads(tool_call["function"]["arguments"] or "{}"),
+            arguments=_parse_arguments(tool_call["function"]["arguments"]),
         )
         for tool_call in message.get("tool_calls") or []
     ]
+
+
+def _parse_arguments(raw_arguments: str | None) -> dict[str, Any] | None:
+    try:
+        arguments = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        return None
+    return arguments if isinstance(arguments, dict) else None
 
 
 def resolution_messages(resolution: ToolResolution) -> list[Message]:
@@ -124,7 +132,8 @@ def skipped_message(tool_call: ToolCall) -> Message:
 
 
 def is_affirmative(text: str) -> bool:
-    words = WORD_PATTERN.findall(text.lower())
+    # Phones and macOS type a typographic apostrophe, which would split "don’t" into "don" + "t".
+    words = WORD_PATTERN.findall(text.lower().replace("’", "'"))
     return (
         bool(words)
         and words[0] in AFFIRMATIVE_WORDS
@@ -176,8 +185,11 @@ class ChatLoop:
             return await self._run_model()
 
         self.session.activate(intent)
-        parts = [self.session.take_late_instructions() if self.messages else None]
-        parts += [format_user_data(user_data) if user_data else None, user_text]
+        parts = [
+            self.session.take_late_instructions(),
+            format_user_data(user_data) if user_data else None,
+            user_text,
+        ]
         self.messages.append(
             {"role": "user", "content": "\n\n".join(part for part in parts if part)}
         )

@@ -10,6 +10,7 @@ from prompt_kit import (
     call_tool_with_retry,
     make_idempotency_key,
 )
+from tests.conftest import implementations_for
 
 
 class FlakyTool:
@@ -100,7 +101,9 @@ async def test_fixed_message_resolution_carries_tool_content_and_exact_text(sess
     tool_function = FlakyTool(
         [ToolError(ErrorKind.RATE_LIMITED, retry_after_seconds=30)] * 3
     )
-    executor = ToolExecutor(session, {"read_thing": tool_function})
+    executor = ToolExecutor(
+        session, implementations_for(session, read_thing=tool_function)
+    )
 
     resolution = await executor.execute(call_for("read_thing"))
 
@@ -109,14 +112,29 @@ async def test_fixed_message_resolution_carries_tool_content_and_exact_text(sess
     assert resolution.content["error"] == "rate_limited"
 
 
+async def test_fixed_message_missing_a_detail_falls_back_to_a_generated_error(session):
+    executor = ToolExecutor(
+        session,
+        implementations_for(
+            session, read_thing=FlakyTool([ToolError(ErrorKind.RATE_LIMITED)] * 3)
+        ),
+    )
+
+    resolution = await executor.execute(call_for("read_thing"))
+
+    assert resolution.status == "error" and resolution.assistant_text is None
+    assert resolution.content["error"] == "rate_limited"
+
+
 async def test_generated_error_resolution_has_no_user_text(session):
     executor = ToolExecutor(
         session,
-        {
-            "read_thing": FlakyTool(
+        implementations_for(
+            session,
+            read_thing=FlakyTool(
                 [ToolError(ErrorKind.NOT_FOUND, hint="Check the ID.")]
-            )
-        },
+            ),
+        ),
     )
 
     resolution = await executor.execute(call_for("read_thing"))
@@ -131,7 +149,9 @@ async def test_generated_error_resolution_has_no_user_text(session):
 
 async def test_confirmation_runs_tool_only_after_approval(session):
     tool_function = FlakyTool([])
-    executor = ToolExecutor(session, {"change_thing": tool_function})
+    executor = ToolExecutor(
+        session, implementations_for(session, change_thing=tool_function)
+    )
 
     pending = await executor.execute(call_for("change_thing"))
     assert (
@@ -148,7 +168,9 @@ async def test_confirmation_runs_tool_only_after_approval(session):
 
 async def test_declined_confirmation_never_runs_tool(session):
     tool_function = FlakyTool([])
-    executor = ToolExecutor(session, {"change_thing": tool_function})
+    executor = ToolExecutor(
+        session, implementations_for(session, change_thing=tool_function)
+    )
     await executor.execute(call_for("change_thing"))
 
     resolution = await executor.resolve_confirmation(approved=False)
@@ -156,6 +178,41 @@ async def test_declined_confirmation_never_runs_tool(session):
     assert (
         resolution.content["error"] == "declined_by_user" and tool_function.calls == []
     )
+
+
+def test_executor_requires_an_implementation_for_every_allowed_tool(session):
+    with pytest.raises(ValueError, match="change_thing"):
+        ToolExecutor(session, {"read_thing": FlakyTool([])})
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [None, {}, {"thing_id": "T-1", "extra": 1}],
+    ids=["not_an_object", "missing_required", "unknown_key"],
+)
+async def test_mismatched_arguments_are_invalid_input_and_never_run(session, arguments):
+    tool_function = FlakyTool([])
+    executor = ToolExecutor(
+        session, implementations_for(session, read_thing=tool_function)
+    )
+
+    resolution = await executor.execute(ToolCall("c1", "read_thing", arguments))
+
+    assert (
+        resolution.content["error"] == "invalid_input" and "hint" in resolution.content
+    )
+    assert tool_function.calls == []
+
+
+async def test_unexpected_tool_exception_is_reported_as_failed_without_retry(session):
+    tool_function = FlakyTool([ConnectionError("db down")])
+    executor = ToolExecutor(
+        session, implementations_for(session, read_thing=tool_function)
+    )
+
+    resolution = await executor.execute(call_for("read_thing"))
+
+    assert resolution.content["error"] == "failed" and len(tool_function.calls) == 1
 
 
 async def test_tool_outside_persona_is_not_allowed(make_registry):
@@ -169,7 +226,8 @@ async def test_tool_outside_persona_is_not_allowed(make_registry):
         }
     )
     executor = ToolExecutor(
-        PromptSession(registry, "agent", {}), {"change_thing": FlakyTool([])}
+        PromptSession(registry, "agent", {}),
+        {"read_thing": FlakyTool([]), "change_thing": FlakyTool([])},
     )
 
     resolution = await executor.execute(call_for("change_thing"))

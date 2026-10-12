@@ -41,10 +41,15 @@ def wrap(tag: str, body: str, name: str | None = None) -> str:
 def format_user_data(user_data: Mapping[str, Any]) -> str:
     """Renders untrusted per-request data for the user turn, never the system prompt."""
     lines = (
-        f"{escape_untrusted(str(key))}: {escape_untrusted(str(value))}"
+        f"{_escape_field(key)}: {_escape_field(value)}"
         for key, value in user_data.items()
     )
     return wrap("user_data", "\n".join(lines))
+
+
+def _escape_field(field: Any) -> str:
+    # One line per field, so a value can't forge extra "key: value" lines.
+    return escape_untrusted(str(field)).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def render_static_sections(

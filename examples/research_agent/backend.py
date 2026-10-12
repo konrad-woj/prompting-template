@@ -1,5 +1,6 @@
 """Read-only repository tools plus an in-memory write overlay, so the example never touches disk."""
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,12 +48,11 @@ class RepositoryBackend:
         ]
 
     async def search_code(self, query: str) -> dict[str, Any]:
-        try:
-            pattern = re.compile(query)
-        except re.error as error:
-            raise ToolError(
-                ErrorKind.INVALID_INPUT, hint=f"Invalid regular expression: {error}"
-            ) from error
+        # The scan is blocking file I/O; asyncio.timeout can only interrupt it off the event loop.
+        return await asyncio.to_thread(self._scan_for, query)
+
+    def _scan_for(self, query: str) -> dict[str, Any]:
+        # Plain substring match: a model-written regex could backtrack for minutes.
         matches = []
         for path in self._source_files():
             try:
@@ -60,7 +60,7 @@ class RepositoryBackend:
             except UnicodeDecodeError:
                 continue
             for line_number, line in enumerate(lines, start=1):
-                if pattern.search(line):
+                if query in line:
                     matches.append(
                         {
                             "path": path.relative_to(self.root).as_posix(),

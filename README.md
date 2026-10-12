@@ -23,6 +23,7 @@ git clone git@github.com:konrad-woj/prompting-template.git
 cd prompting-template
 uv sync --all-extras          # runtime + openai client for the live example
 uv run pytest                 # unit, loop and golden-snapshot tests
+uv run task check             # lint, tests, prompt validation and both mock runs
 ```
 
 Install the Claude Code skill (once per machine) so Claude can use the template in any project:
