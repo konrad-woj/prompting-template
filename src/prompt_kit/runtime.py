@@ -22,14 +22,14 @@ from typing import Any, Literal
 
 from prompt_kit.loader import PromptUnit
 from prompt_kit.models import ErrorKind, ToolMeta
-from prompt_kit.render import render_fixed_message
+from prompt_kit.render import MissingVariableError, render_fixed_message
 from prompt_kit.session import PromptSession
 
 logger = logging.getLogger(__name__)
 
 ToolFunction = Callable[..., Awaitable[Any]]
 
-DEFAULT_HINTS = {
+DEFAULT_HINTS: dict[str, str] = {
     ErrorKind.NOT_ALLOWED: "This tool isn't available in this conversation; continue without it.",
     ErrorKind.VERIFICATION_REQUIRED: "Verify the user with the verification tool first, then call this again.",
     ErrorKind.VERIFICATION_LOCKED: "Verification is locked after repeated failures; stop asking for details and offer a handoff.",
@@ -56,6 +56,8 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # Set by the adapter when the provider's arguments couldn't be parsed; `arguments` is then empty.
+    arguments_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,12 +82,8 @@ class ToolResolution:
 
     tool_call_id: str
     status: Literal["ok", "error", "fixed", "confirmation_required"]
-    content: dict[str, Any] | None = None
+    content: dict[str, Any] = field(default_factory=dict)
     assistant_text: str | None = None
-
-    @property
-    def is_error(self) -> bool:
-        return self.status in ("error", "fixed")
 
 
 def make_idempotency_key(
@@ -98,6 +96,20 @@ def make_idempotency_key(
         sort_keys=True,
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _argument_problem(input_schema: Mapping[str, Any], call: ToolCall) -> str | None:
+    # Non-strict providers don't enforce the schema, and a mismatch would surface as a TypeError.
+    properties = input_schema.get("properties", {})
+    required = input_schema.get("required", [])
+    expected = f"Send a JSON object with keys {sorted(properties)}; required: {sorted(required)}."
+    if call.arguments_error:
+        return f"{call.arguments_error}. {expected}"
+    unknown = sorted(call.arguments.keys() - properties.keys())
+    missing = sorted(set(required) - call.arguments.keys())
+    if unknown or missing:
+        return f"Unknown arguments {unknown}, missing arguments {missing}. {expected}"
+    return None
 
 
 def backoff_delay(meta: ToolMeta, attempt: int, error: ToolError) -> float:
@@ -122,6 +134,7 @@ async def call_tool_with_retry(
         call_arguments["idempotency_key"] = idempotency_key
 
     last_error = ToolError(ErrorKind.FAILED)
+    attempt = 0
     for attempt in range(1, meta.max_retries + 2):
         try:
             async with asyncio.timeout(meta.timeout_seconds):
@@ -162,21 +175,37 @@ class ToolExecutor:
     implementations: Mapping[str, ToolFunction]
     pending_confirmation: ToolCall | None = field(default=None, init=False)
 
+    def __post_init__(self) -> None:
+        missing = sorted(
+            set(self.session.allowed_tool_names) - self.implementations.keys()
+        )
+        if missing:
+            raise ValueError(f"no implementation for allowed tools: {missing}")
+
     async def execute(self, call: ToolCall) -> ToolResolution:
         tool = self.session.registry.tools.get(call.name)
         if tool is None or call.name not in self.session.allowed_tool_names:
             return self._error(call, ToolError(ErrorKind.NOT_ALLOWED))
+        argument_problem = _argument_problem(tool.meta.input_schema, call)
+        if argument_problem:
+            return self._error(
+                call, ToolError(ErrorKind.INVALID_INPUT, hint=argument_problem)
+            )
         if tool.meta.grants_verification and self.session.verification_locked:
             return self._error(call, ToolError(ErrorKind.VERIFICATION_LOCKED))
         if tool.meta.requires_verification and not self.session.verified:
             return self._error(call, ToolError(ErrorKind.VERIFICATION_REQUIRED))
         if tool.meta.requires_confirmation:
-            self.pending_confirmation = call
             confirmation_text = render_fixed_message(
                 self.session.registry,
                 f"confirm_{call.name}",
                 {**self.session.config, **call.arguments},
             )
+            if confirmation_text is None:
+                raise RuntimeError(
+                    f"tool '{call.name}' has no confirm_{call.name} message; run prompt-kit validate"
+                )
+            self.pending_confirmation = call
             return ToolResolution(
                 call.id, "confirmation_required", assistant_text=confirmation_text
             )
@@ -201,17 +230,22 @@ class ToolExecutor:
             if tool.meta.side_effect
             else None
         )
-        outcome = await call_tool_with_retry(
-            tool, self.implementations[call.name], call.arguments, idempotency_key
-        )
-        if tool.meta.grants_verification and outcome.success:
+        try:
+            outcome = await call_tool_with_retry(
+                tool, self.implementations[call.name], call.arguments, idempotency_key
+            )
+        except Exception:
+            # Caught here rather than in the retry loop so a bug in tool code is never retried.
+            logger.exception("tool %s raised an unexpected error", call.name)
+            return self._error(call, ToolError(ErrorKind.FAILED))
+        if outcome.error is not None:
+            return self._error(call, outcome.error)
+        if tool.meta.grants_verification:
             self.session.record_verification(bool(outcome.result.get("verified")))
-        if outcome.success:
-            content = {"result": outcome.result}
-            if confirmed:
-                content["user_confirmed"] = True
-            return ToolResolution(call.id, "ok", content=content)
-        return self._error(call, outcome.error)
+        content = {"result": outcome.result}
+        if confirmed:
+            content["user_confirmed"] = True
+        return ToolResolution(call.id, "ok", content=content)
 
     def _error(self, call: ToolCall, error: ToolError) -> ToolResolution:
         content: dict[str, Any] = {
@@ -222,9 +256,16 @@ class ToolExecutor:
         hint = error.hint or DEFAULT_HINTS.get(error.kind)
         if hint:
             content["hint"] = hint
-        fixed_text = render_fixed_message(
-            self.session.registry, error.kind, {**self.session.config, **error.details}
-        )
+        try:
+            fixed_text = render_fixed_message(
+                self.session.registry,
+                error.kind,
+                {**self.session.config, **error.details},
+            )
+        except MissingVariableError:
+            # Details come from the tool at runtime, so validate can't catch this ahead of time.
+            logger.exception("fixed message for %s is missing variables", error.kind)
+            fixed_text = None
         if fixed_text is not None:
             return ToolResolution(
                 call.id, "fixed", content=content, assistant_text=fixed_text

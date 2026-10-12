@@ -10,6 +10,7 @@ from prompt_kit.adapters.openai import (
     is_affirmative,
     to_openai_tools,
 )
+from tests.conftest import implementations_for
 
 
 async def fake_tool(**arguments):
@@ -26,6 +27,8 @@ async def fake_tool(**arguments):
         ("yes but not now", False),
         ("no, refund 30 instead", False),
         ("what does that mean?", False),
+        ("Yes — actually don’t", False),
+        ("sure, but only half", False),
     ],
 )
 def test_is_affirmative(reply, expected):
@@ -40,7 +43,9 @@ async def test_confirmation_reply_text_reaches_the_model(session):
         ]
     )
     loop = ChatLoop(
-        session, ToolExecutor(session, {"change_thing": fake_tool}), model.complete
+        session,
+        ToolExecutor(session, implementations_for(session, change_thing=fake_tool)),
+        model.complete,
     )
     await loop.send("change it", intent="change")
 
@@ -53,7 +58,9 @@ async def test_confirmation_reply_text_reaches_the_model(session):
 
 async def test_late_skills_go_into_the_user_turn_and_system_prompt_stays_fixed(session):
     model = ScriptedModel([say("Read."), say("Changed.")])
-    loop = ChatLoop(session, ToolExecutor(session, {}), model.complete)
+    loop = ChatLoop(
+        session, ToolExecutor(session, implementations_for(session)), model.complete
+    )
 
     await loop.send("read it", intent="read")
     await loop.send("now change it", intent="change")
@@ -61,6 +68,20 @@ async def test_late_skills_go_into_the_user_turn_and_system_prompt_stays_fixed(s
     assert model.system_prompts[0] == model.system_prompts[1]
     assert loop.messages[-2]["content"].startswith('<skill name="changing">')
     assert loop.messages[-2]["content"].endswith("now change it")
+
+
+async def test_first_turn_gets_its_skills_when_system_prompt_was_rendered_early(
+    session,
+):
+    model = ScriptedModel([say("Read.")])
+    loop = ChatLoop(
+        session, ToolExecutor(session, implementations_for(session)), model.complete
+    )
+    session.system_prompt()
+
+    await loop.send("read it", intent="read")
+
+    assert loop.messages[0]["content"].startswith('<skill name="reading">')
 
 
 def test_clear_old_tool_results_keeps_recent_and_structure():
@@ -98,7 +119,10 @@ async def test_every_tool_call_is_answered_when_a_confirmation_pauses_the_turn(s
     )
     loop = ChatLoop(
         session,
-        ToolExecutor(session, {"change_thing": fake_tool, "read_thing": fake_tool}),
+        ToolExecutor(
+            session,
+            implementations_for(session, change_thing=fake_tool, read_thing=fake_tool),
+        ),
         model.complete,
     )
 
@@ -126,7 +150,9 @@ async def test_fixed_message_is_recorded_in_history_without_calling_the_model(se
 
     model = ScriptedModel([call("read_thing", thing_id="T-1")])
     loop = ChatLoop(
-        session, ToolExecutor(session, {"read_thing": rate_limited}), model.complete
+        session,
+        ToolExecutor(session, implementations_for(session, read_thing=rate_limited)),
+        model.complete,
     )
 
     reply = await loop.send("read it", intent="read")
@@ -134,6 +160,20 @@ async def test_fixed_message_is_recorded_in_history_without_calling_the_model(se
     assert reply == "Busy, retry in 5s."
     assert loop.messages[-1] == {"role": "assistant", "content": "Busy, retry in 5s."}
     assert json.loads(loop.messages[-2]["content"])["error"] == "rate_limited"
+
+
+async def test_malformed_tool_arguments_go_back_to_the_model_as_invalid_input(session):
+    malformed_call = call("read_thing")
+    malformed_call["tool_calls"][0]["function"]["arguments"] = '{"thing_id": '
+    model = ScriptedModel([malformed_call, say("Let me retry that.")])
+    loop = ChatLoop(
+        session,
+        ToolExecutor(session, implementations_for(session)),
+        model.complete,
+    )
+
+    assert await loop.send("read it", intent="read") == "Let me retry that."
+    assert json.loads(loop.messages[-2]["content"])["error"] == "invalid_input"
 
 
 def test_non_strict_tools_drop_strict_flag_and_additional_properties(session):

@@ -56,18 +56,26 @@ skill followed by its `<guidance>` partials. Each section is wrapped in a named 
 - `fixed`: exact text sent to the user without a model call, found by `trigger_kinds`.
   Use for compliance wording and confirmations. Never `includes:`-ed into a skill.
   Variables come from config plus the error's details (or the tool arguments for
-  `confirm_<tool>`).
+  `confirm_<tool>`). If an error lacks a detail the message uses, the executor logs it and
+  sends a normal error to the model instead, so avoid variables for optional details.
 
 ## Runtime (enforced in code)
 
 - Retries: `call_tool_with_retry` honours `max_retries`/`retry_on`, exponential backoff with
-  jitter or the error's `retry_after_seconds`, and a per-attempt timeout.
+  jitter or the error's `retry_after_seconds`, and a per-attempt timeout. The timeout only
+  fires at an `await`, so tool implementations must not block: move blocking I/O or CPU
+  work to `asyncio.to_thread`, and don't retry such a tool on `timeout`, because the thread
+  keeps running.
 - Side effects: the executor derives an idempotency key from (session, tool, arguments) and
   passes it as `idempotency_key`; a timed-out side effect is reported as `outcome_unknown`.
 - Verification: `requires_verification` tools are blocked until a `grants_verification` tool
   returns `{"verified": true}`; after `max_verification_attempts` failures it locks.
 - Confirmation: `requires_confirmation` tools pause, show `confirm_<tool>`, and run only on an
   explicit yes; a no returns `declined_by_user` to the model.
+- Boundaries: `ToolExecutor` requires an implementation for every allowed tool. Arguments
+  that aren't a JSON object, or whose keys don't match `input_schema`, return
+  `invalid_input` without running the tool. Exceptions other than `ToolError` are logged and
+  returned as `failed`, without retry.
 - Tool results are JSON facts (`error`, `outcome_known`, `hint`, details); behaviour guidance
   stays in the prompt partials.
 

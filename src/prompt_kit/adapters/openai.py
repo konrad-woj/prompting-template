@@ -45,7 +45,7 @@ AFFIRMATIVE_WORDS = frozenset(
     }
 )
 NEGATIVE_WORDS = frozenset(
-    {"no", "not", "don't", "dont", "cancel", "stop", "wait", "instead"}
+    {"no", "not", "don't", "dont", "cancel", "stop", "wait", "instead", "but"}
 )
 CLEARED_TOOL_RESULT = json.dumps(
     {
@@ -87,14 +87,20 @@ def _without_additional_properties(schema: Any) -> Any:
 
 
 def tool_calls_from_message(message: Message) -> list[ToolCall]:
-    return [
-        ToolCall(
-            id=tool_call["id"],
-            name=tool_call["function"]["name"],
-            arguments=json.loads(tool_call["function"]["arguments"] or "{}"),
+    return [_tool_call_from(tool_call) for tool_call in message.get("tool_calls") or []]
+
+
+def _tool_call_from(tool_call: dict[str, Any]) -> ToolCall:
+    call_id, name = tool_call["id"], tool_call["function"]["name"]
+    try:
+        arguments = json.loads(tool_call["function"]["arguments"] or "{}")
+    except json.JSONDecodeError:
+        arguments = None
+    if not isinstance(arguments, dict):
+        return ToolCall(
+            call_id, name, {}, arguments_error="Arguments were not a JSON object"
         )
-        for tool_call in message.get("tool_calls") or []
-    ]
+    return ToolCall(call_id, name, arguments)
 
 
 def resolution_messages(resolution: ToolResolution) -> list[Message]:
@@ -124,7 +130,8 @@ def skipped_message(tool_call: ToolCall) -> Message:
 
 
 def is_affirmative(text: str) -> bool:
-    words = WORD_PATTERN.findall(text.lower())
+    # Phones and macOS type a typographic apostrophe, which would split "don’t" into "don" + "t".
+    words = WORD_PATTERN.findall(text.lower().replace("’", "'"))
     return (
         bool(words)
         and words[0] in AFFIRMATIVE_WORDS
@@ -169,6 +176,7 @@ class ChatLoop:
             self.messages += resolution_messages(resolution)[:1]
             self.messages.append({"role": "user", "content": user_text})
             if resolution.status == "fixed":
+                assert resolution.assistant_text is not None
                 self.messages.append(
                     {"role": "assistant", "content": resolution.assistant_text}
                 )
@@ -176,8 +184,11 @@ class ChatLoop:
             return await self._run_model()
 
         self.session.activate(intent)
-        parts = [self.session.take_late_instructions() if self.messages else None]
-        parts += [format_user_data(user_data) if user_data else None, user_text]
+        parts = [
+            self.session.take_late_instructions(),
+            format_user_data(user_data) if user_data else None,
+            user_text,
+        ]
         self.messages.append(
             {"role": "user", "content": "\n\n".join(part for part in parts if part)}
         )
@@ -205,5 +216,6 @@ class ChatLoop:
                     self.messages += [
                         skipped_message(skipped) for skipped in tool_calls[index + 1 :]
                     ]
+                    assert resolution.assistant_text is not None
                     return resolution.assistant_text
         raise RuntimeError(f"no final answer after {self.max_model_calls} model calls")

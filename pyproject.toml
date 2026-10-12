@@ -18,9 +18,12 @@ prompt-kit = "prompt_kit.cli:main"
 
 [dependency-groups]
 dev = [
+    "openai>=1.60",
+    "pyright>=1.1.414",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.16.9",
+    "taskipy>=1.14.1",
 ]
 
 [build-system]
@@ -30,6 +33,56 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/prompt_kit"]
 
+[tool.taskipy.tasks]
+lint = "ruff check . && ruff format --check ."
+test = "pytest -q"
+precommits ="pytest && ruff check . --fix --unsafe-fixes && ruff format . && pyright ."
+validate = "prompt-kit validate --root prompts --config prompts/config.yaml && prompt-kit validate --root examples/support_agent/prompts --config examples/support_agent/prompts/config.yaml && prompt-kit validate --root examples/research_agent/prompts --config examples/research_agent/prompts/config.yaml"
+mocks = "python -m examples.support_agent.run_mock > /dev/null && python -m examples.research_agent.run_mock > /dev/null"
+check = "task lint && task test && task validate && task mocks"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+src = ["src", "."]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "RUF",  # ruff-specific
+    "ANN",  # type annotations
+    "D",    # pydocstyle
+]
+ignore = [
+    "D100", "D101", "D102", "D103", "D104", "D105", "D107",  # docstrings only where they add value
+    "ANN401",  # Any is sometimes the honest type
+    "E501",  # formatter owns line length; long string literals are fine
+]
+allowed-confusables = ["’"]  # confirmation parsing normalizes the typographic apostrophe
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = ["src", "tests", "examples"]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"

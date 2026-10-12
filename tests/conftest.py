@@ -115,5 +115,17 @@ def session(make_registry) -> PromptSession:
     return PromptSession(make_registry(), persona="agent", config={"agent_name": "Ava"})
 
 
+async def unexpected_tool(**arguments):
+    raise AssertionError("this tool was not expected to run")
+
+
+def implementations_for(session: PromptSession, **overrides) -> dict:
+    """Implementations for every allowed tool; tools not in `overrides` must not be called."""
+    return {
+        name: overrides.get(name, unexpected_tool)
+        for name in session.allowed_tool_names
+    }
+
+
 def load_example_config(prompts_dir: Path) -> dict:
     return yaml.safe_load((prompts_dir / "config.yaml").read_text())
