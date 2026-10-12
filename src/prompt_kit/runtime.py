@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 ToolFunction = Callable[..., Awaitable[Any]]
 
-DEFAULT_HINTS = {
+DEFAULT_HINTS: dict[str, str] = {
     ErrorKind.NOT_ALLOWED: "This tool isn't available in this conversation; continue without it.",
     ErrorKind.VERIFICATION_REQUIRED: "Verify the user with the verification tool first, then call this again.",
     ErrorKind.VERIFICATION_LOCKED: "Verification is locked after repeated failures; stop asking for details and offer a handoff.",
@@ -55,8 +55,9 @@ class ToolError(Exception):
 class ToolCall:
     id: str
     name: str
-    # None when the model sent arguments that aren't a JSON object.
-    arguments: dict[str, Any] | None
+    arguments: dict[str, Any]
+    # Set by the adapter when the provider's arguments couldn't be parsed; `arguments` is then empty.
+    arguments_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,7 @@ class ToolResolution:
 
     tool_call_id: str
     status: Literal["ok", "error", "fixed", "confirmation_required"]
-    content: dict[str, Any] | None = None
+    content: dict[str, Any] = field(default_factory=dict)
     assistant_text: str | None = None
 
 
@@ -97,17 +98,15 @@ def make_idempotency_key(
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _argument_problem(
-    input_schema: Mapping[str, Any], arguments: Mapping[str, Any] | None
-) -> str | None:
+def _argument_problem(input_schema: Mapping[str, Any], call: ToolCall) -> str | None:
     # Non-strict providers don't enforce the schema, and a mismatch would surface as a TypeError.
     properties = input_schema.get("properties", {})
     required = input_schema.get("required", [])
     expected = f"Send a JSON object with keys {sorted(properties)}; required: {sorted(required)}."
-    if arguments is None:
-        return f"Arguments were not a JSON object. {expected}"
-    unknown = sorted(arguments.keys() - properties.keys())
-    missing = sorted(set(required) - arguments.keys())
+    if call.arguments_error:
+        return f"{call.arguments_error}. {expected}"
+    unknown = sorted(call.arguments.keys() - properties.keys())
+    missing = sorted(set(required) - call.arguments.keys())
     if unknown or missing:
         return f"Unknown arguments {unknown}, missing arguments {missing}. {expected}"
     return None
@@ -135,6 +134,7 @@ async def call_tool_with_retry(
         call_arguments["idempotency_key"] = idempotency_key
 
     last_error = ToolError(ErrorKind.FAILED)
+    attempt = 0
     for attempt in range(1, meta.max_retries + 2):
         try:
             async with asyncio.timeout(meta.timeout_seconds):
@@ -186,7 +186,7 @@ class ToolExecutor:
         tool = self.session.registry.tools.get(call.name)
         if tool is None or call.name not in self.session.allowed_tool_names:
             return self._error(call, ToolError(ErrorKind.NOT_ALLOWED))
-        argument_problem = _argument_problem(tool.meta.input_schema, call.arguments)
+        argument_problem = _argument_problem(tool.meta.input_schema, call)
         if argument_problem:
             return self._error(
                 call, ToolError(ErrorKind.INVALID_INPUT, hint=argument_problem)
@@ -196,12 +196,16 @@ class ToolExecutor:
         if tool.meta.requires_verification and not self.session.verified:
             return self._error(call, ToolError(ErrorKind.VERIFICATION_REQUIRED))
         if tool.meta.requires_confirmation:
-            self.pending_confirmation = call
             confirmation_text = render_fixed_message(
                 self.session.registry,
                 f"confirm_{call.name}",
                 {**self.session.config, **call.arguments},
             )
+            if confirmation_text is None:
+                raise RuntimeError(
+                    f"tool '{call.name}' has no confirm_{call.name} message; run prompt-kit validate"
+                )
+            self.pending_confirmation = call
             return ToolResolution(
                 call.id, "confirmation_required", assistant_text=confirmation_text
             )
@@ -234,14 +238,14 @@ class ToolExecutor:
             # Caught here rather than in the retry loop so a bug in tool code is never retried.
             logger.exception("tool %s raised an unexpected error", call.name)
             return self._error(call, ToolError(ErrorKind.FAILED))
-        if tool.meta.grants_verification and outcome.success:
+        if outcome.error is not None:
+            return self._error(call, outcome.error)
+        if tool.meta.grants_verification:
             self.session.record_verification(bool(outcome.result.get("verified")))
-        if outcome.success:
-            content = {"result": outcome.result}
-            if confirmed:
-                content["user_confirmed"] = True
-            return ToolResolution(call.id, "ok", content=content)
-        return self._error(call, outcome.error)
+        content = {"result": outcome.result}
+        if confirmed:
+            content["user_confirmed"] = True
+        return ToolResolution(call.id, "ok", content=content)
 
     def _error(self, call: ToolCall, error: ToolError) -> ToolResolution:
         content: dict[str, Any] = {

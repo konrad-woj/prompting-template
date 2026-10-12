@@ -13,10 +13,14 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from openai import AsyncOpenAI
+from openai.types.chat import (
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
 
 from examples.support_agent.backend import SupportBackend
 from prompt_kit import PromptSession, Registry, ToolExecutor
@@ -54,8 +58,11 @@ async def main(model: str) -> None:
         async def complete(
             messages: list[Message], tools: list[dict[str, Any]]
         ) -> Message:
+            # The loop builds plain dicts in the Chat Completions shape; the SDK types them as TypedDicts.
             response = await client.chat.completions.create(
-                model=model, messages=messages, tools=tools
+                model=model,
+                messages=cast("list[ChatCompletionMessageParam]", messages),
+                tools=cast("list[ChatCompletionToolUnionParam]", tools),
             )
             usage = response.usage
             cached_tokens = (

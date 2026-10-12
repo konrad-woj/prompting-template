@@ -87,22 +87,20 @@ def _without_additional_properties(schema: Any) -> Any:
 
 
 def tool_calls_from_message(message: Message) -> list[ToolCall]:
-    return [
-        ToolCall(
-            id=tool_call["id"],
-            name=tool_call["function"]["name"],
-            arguments=_parse_arguments(tool_call["function"]["arguments"]),
-        )
-        for tool_call in message.get("tool_calls") or []
-    ]
+    return [_tool_call_from(tool_call) for tool_call in message.get("tool_calls") or []]
 
 
-def _parse_arguments(raw_arguments: str | None) -> dict[str, Any] | None:
+def _tool_call_from(tool_call: dict[str, Any]) -> ToolCall:
+    call_id, name = tool_call["id"], tool_call["function"]["name"]
     try:
-        arguments = json.loads(raw_arguments or "{}")
+        arguments = json.loads(tool_call["function"]["arguments"] or "{}")
     except json.JSONDecodeError:
-        return None
-    return arguments if isinstance(arguments, dict) else None
+        arguments = None
+    if not isinstance(arguments, dict):
+        return ToolCall(
+            call_id, name, {}, arguments_error="Arguments were not a JSON object"
+        )
+    return ToolCall(call_id, name, arguments)
 
 
 def resolution_messages(resolution: ToolResolution) -> list[Message]:
@@ -178,6 +176,7 @@ class ChatLoop:
             self.messages += resolution_messages(resolution)[:1]
             self.messages.append({"role": "user", "content": user_text})
             if resolution.status == "fixed":
+                assert resolution.assistant_text is not None
                 self.messages.append(
                     {"role": "assistant", "content": resolution.assistant_text}
                 )
@@ -217,5 +216,6 @@ class ChatLoop:
                     self.messages += [
                         skipped_message(skipped) for skipped in tool_calls[index + 1 :]
                     ]
+                    assert resolution.assistant_text is not None
                     return resolution.assistant_text
         raise RuntimeError(f"no final answer after {self.max_model_calls} model calls")

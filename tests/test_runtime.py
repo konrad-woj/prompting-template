@@ -55,11 +55,8 @@ async def test_does_not_retry_kinds_outside_retry_on(session):
         session.registry.tools["read_thing"], tool_function, {"thing_id": "T-1"}
     )
 
-    assert (
-        not outcome.success
-        and outcome.attempts == 1
-        and outcome.error.kind == ErrorKind.INVALID_INPUT
-    )
+    assert outcome.error is not None and outcome.attempts == 1
+    assert outcome.error.kind == ErrorKind.INVALID_INPUT
 
 
 async def test_gives_up_after_retry_budget(session):
@@ -87,6 +84,7 @@ async def test_timed_out_side_effect_reports_outcome_unknown(session):
         idempotency_key="key",
     )
 
+    assert outcome.error is not None
     assert outcome.error.kind == ErrorKind.OUTCOME_UNKNOWN
 
 
@@ -186,17 +184,21 @@ def test_executor_requires_an_implementation_for_every_allowed_tool(session):
 
 
 @pytest.mark.parametrize(
-    "arguments",
-    [None, {}, {"thing_id": "T-1", "extra": 1}],
-    ids=["not_an_object", "missing_required", "unknown_key"],
+    "tool_call",
+    [
+        ToolCall("c1", "read_thing", {}, arguments_error="Arguments were not JSON"),
+        ToolCall("c1", "read_thing", {}),
+        ToolCall("c1", "read_thing", {"thing_id": "T-1", "extra": 1}),
+    ],
+    ids=["unparseable", "missing_required", "unknown_key"],
 )
-async def test_mismatched_arguments_are_invalid_input_and_never_run(session, arguments):
+async def test_mismatched_arguments_are_invalid_input_and_never_run(session, tool_call):
     tool_function = FlakyTool([])
     executor = ToolExecutor(
         session, implementations_for(session, read_thing=tool_function)
     )
 
-    resolution = await executor.execute(ToolCall("c1", "read_thing", arguments))
+    resolution = await executor.execute(tool_call)
 
     assert (
         resolution.content["error"] == "invalid_input" and "hint" in resolution.content
